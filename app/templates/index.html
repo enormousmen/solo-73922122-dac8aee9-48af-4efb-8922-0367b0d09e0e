@@ -1,0 +1,348 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>订单表批次号在线迁移演示</title>
+<style>
+  :root {
+    --bg: #f4f6fa; --card: #fff; --line: #dfe4ec; --text: #1f2733;
+    --muted: #6b7686; --blue: #2563eb; --green: #15803d; --red: #b91c1c;
+    --amber: #b45309; --gray: #475569;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.6 -apple-system, "Segoe UI", "PingFang SC",
+         "Microsoft YaHei", sans-serif; background: var(--bg); color: var(--text); }
+  header { background: #111827; color: #fff; padding: 18px 28px; }
+  header h1 { margin: 0; font-size: 20px; }
+  header p { margin: 4px 0 0; color: #9ca3af; font-size: 13px; }
+  main { max-width: 1180px; margin: 22px auto; padding: 0 18px;
+         display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .card { background: var(--card); border: 1px solid var(--line);
+          border-radius: 10px; padding: 16px 18px; }
+  .card.full { grid-column: 1 / -1; }
+  .card h2 { margin: 0 0 12px; font-size: 15px; display: flex;
+             align-items: center; gap: 8px; }
+  .badge { display: inline-block; padding: 2px 10px; border-radius: 999px;
+           font-size: 12px; font-weight: 600; }
+  .b-idle { background: #e2e8f0; color: var(--gray); }
+  .b-waiting { background: #fef3c7; color: var(--amber); }
+  .b-running { background: #dbeafe; color: var(--blue); }
+  .b-succeeded { background: #dcfce7; color: var(--green); }
+  .b-failed { background: #fee2e2; color: var(--red); }
+  .b-cancelled { background: #e2e8f0; color: var(--gray); }
+  .b-yes { background: #dcfce7; color: var(--green); }
+  .b-no { background: #f1f5f9; color: var(--muted); }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { border: 1px solid var(--line); padding: 6px 9px; text-align: left; }
+  th { background: #f8fafc; font-weight: 600; }
+  button { border: 1px solid transparent; border-radius: 7px; padding: 7px 14px;
+           font-size: 13px; cursor: pointer; background: var(--blue); color: #fff; }
+  button.secondary { background: #fff; color: var(--text); border-color: var(--line); }
+  button.danger { background: var(--red); }
+  button.ghost { background: #475569; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+  input, select { padding: 7px 9px; border: 1px solid var(--line);
+                  border-radius: 7px; font-size: 13px; }
+  label { font-size: 13px; color: var(--muted); }
+  .muted { color: var(--muted); font-size: 12px; }
+  .err { color: var(--red); font-size: 13px; min-height: 18px; }
+  .ok { color: var(--green); font-size: 13px; min-height: 18px; }
+  pre.log { background: #0f172a; color: #cbd5e1; border-radius: 8px;
+            padding: 12px; max-height: 260px; overflow: auto; font-size: 12px;
+            margin: 0; white-space: pre-wrap; }
+  .kv { display: grid; grid-template-columns: 130px 1fr; gap: 4px 10px;
+        font-size: 13px; }
+  .kv b { color: var(--muted); font-weight: 500; }
+  .pill { font-size: 11px; padding: 1px 7px; border-radius: 999px;
+          background: #eef2ff; color: #3730a3; }
+  .hint { background: #fffbeb; border: 1px solid #fde68a; color: #92400e;
+          border-radius: 8px; padding: 10px 12px; font-size: 12.5px; }
+  ul.steps { margin: 8px 0 0; padding-left: 18px; color: var(--muted);
+             font-size: 12.5px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>订单系统发版：orders / order_items 在线加批次号列（batch_no）</h1>
+  <p>PostgreSQL 锁等待演示 · 等锁期间普通读写不阻塞 · 两表 ALTER 同事务原子提交</p>
+</header>
+
+<main>
+  <section class="card">
+    <h2>① 演示读事务（保持打开，持有表锁）</h2>
+    <div class="row">
+      <select id="txTable">
+        <option value="orders">orders 订单表</option>
+        <option value="order_items">order_items 明细表</option>
+      </select>
+      <button onclick="openTx()">打开并保持读事务</button>
+    </div>
+    <p class="muted" style="margin:8px 0">事务不提交也不回滚，直到值班员手动结束。</p>
+    <table>
+      <thead><tr><th>令牌</th><th>表</th><th>PID</th><th>开始</th><th>操作</th></tr></thead>
+      <tbody id="txBody"><tr><td colspan="5" class="muted">暂无打开的演示事务</td></tr></tbody>
+    </table>
+  </section>
+
+  <section class="card">
+    <h2>② 加列迁移申请</h2>
+    <div class="kv">
+      <b>当前状态</b><span id="migState"></span>
+      <b>申请时间</b><span id="migRequested">-</span>
+      <b>探测/尝试</b><span id="migAttempts">0</span>
+      <b>完成时间</b><span id="migFinished">-</span>
+      <b>错误信息</b><span id="migError" class="err"></span>
+    </div>
+    <div class="row" style="margin-top:12px">
+      <label><input type="checkbox" id="injectFailure"> 故障注入（验证失败回滚、结构照旧）</label>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <button id="btnSubmit" onclick="submitMigration()">提交加列申请</button>
+      <button id="btnCancel" class="danger" onclick="cancelMigration()">撤销等待中的申请</button>
+    </div>
+    <p class="muted" id="cancelHint" style="margin:8px 0 0"></p>
+  </section>
+
+  <section class="card full">
+    <h2>③ 批次号列是否生效</h2>
+    <table>
+      <thead><tr><th>表</th><th>batch_no 列</th><th>说明</th></tr></thead>
+      <tbody id="colBody"></tbody>
+    </table>
+    <p class="hint" style="margin-top:10px">
+      实现要点：迁移线程先用 pg_locks 探测两表上的冲突锁，无冲突才在
+      <b>同一个数据库事务</b>里执行两条 ALTER TABLE，并设置 250ms
+      lock_timeout 兜底；拿不到锁就回滚本轮、0.5s 后重试，
+      <b>不进入 PostgreSQL 服务器端锁队列</b>，因此等锁期间新发起的
+      普通读写都能立即完成。
+    </p>
+  </section>
+
+  <section class="card">
+    <h2>④ 试写订单 / 明细（等锁期间也应秒回）</h2>
+    <div class="row">
+      <input id="inCustomer" placeholder="客户名" value="王五">
+      <input id="inSku" placeholder="商品 SKU" value="SKU-D900">
+      <input id="inQty" placeholder="数量" value="3" style="width:80px">
+      <input id="inPrice" placeholder="单价" value="12.50" style="width:100px">
+      <input id="inBatch" placeholder="批次号（迁移后生效）" value="B-2026-11">
+    </div>
+    <div class="row" style="margin-top:10px">
+      <button onclick="createOrder()">写入订单+明细并计时</button>
+    </div>
+    <p id="writeResult" class="ok"></p>
+    <div class="row" style="margin-top:6px">
+      <button class="secondary" onclick="readOrders()">普通查询并计时</button>
+      <button class="ghost" onclick="resetDemo()">重置演示（重建样例数据）</button>
+    </div>
+    <p id="readResult" class="ok"></p>
+  </section>
+
+  <section class="card">
+    <h2>⑤ 服务器端锁队列实况（pg_locks）</h2>
+    <table>
+      <thead><tr><th>表</th><th>锁模式</th><th>已授予</th><th>会话状态</th><th>SQL</th></tr></thead>
+      <tbody id="lockBody"><tr><td colspan="5" class="muted">无</td></tr></tbody>
+    </table>
+    <p class="muted" style="margin:8px 0 0">
+      等锁期间这里只应看到演示事务的已授予锁，不应出现 granted=false 的
+      ALTER 排队记录——这正是普通读写不被堵住的原因。
+    </p>
+  </section>
+
+  <section class="card full">
+    <h2>⑥ 样例订单与明细</h2>
+    <table>
+      <thead id="ordersHead"></thead>
+      <tbody id="ordersBody"></tbody>
+    </table>
+  </section>
+
+  <section class="card full">
+    <h2>事件日志</h2>
+    <pre id="eventLog" class="log"></pre>
+    <ul class="steps">
+      <li>步骤 1：在 ① 打开任一表演示事务并保持；</li>
+      <li>步骤 2：在 ② 提交加列，状态变为"等待锁中"，此时在 ④ 试写/查询均秒回；</li>
+      <li>步骤 3：在 ① 手动结束演示事务，迁移自动继续，两列一同生效；</li>
+      <li>也可在等待中撤销，撤销后即使结束演示事务也不会加列；勾选故障注入可验证失败回滚。</li>
+    </ul>
+  </section>
+</main>
+
+<script>
+let lastOrdersKey = "";
+
+async function api(path, opts = {}) {
+  const res = await fetch(path, {
+    headers: {"Content-Type": "application/json"},
+    ...opts,
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || ("HTTP " + res.status));
+  return data;
+}
+function post(path, body) {
+  return api(path, {method: "POST", body: JSON.stringify(body || {})});
+}
+function esc(s) {
+  return String(s ?? "").replace(/[&<>"]/g,
+    c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+}
+
+async function openTx() {
+  try {
+    await post("/api/demo-tx/open", {table: document.getElementById("txTable").value});
+  } catch (e) { alert(e.message); }
+  refresh();
+}
+async function closeTx(token) {
+  try { await post("/api/demo-tx/close", {token}); }
+  catch (e) { alert(e.message); }
+  refresh();
+}
+async function submitMigration() {
+  try {
+    await post("/api/migration/submit", {
+      inject_failure: document.getElementById("injectFailure").checked,
+    });
+  } catch (e) { alert(e.message); }
+  refresh();
+}
+async function cancelMigration() {
+  if (!confirm("确认撤销等待中的加列申请？撤销后即使演示事务释放锁，也不会再执行加列。")) return;
+  try { await post("/api/migration/cancel"); }
+  catch (e) { alert(e.message); }
+  refresh();
+}
+async function createOrder() {
+  const t0 = performance.now();
+  try {
+    const r = await post("/api/orders", {
+      customer: document.getElementById("inCustomer").value,
+      items: [{
+        sku: document.getElementById("inSku").value,
+        quantity: document.getElementById("inQty").value,
+        unit_price: document.getElementById("inPrice").value,
+      }],
+      batch_no: document.getElementById("inBatch").value || null,
+    });
+    const ms = (performance.now() - t0).toFixed(1);
+    document.getElementById("writeResult").textContent =
+      `写入成功：订单号 ${r.order_no}（id=${r.order_id}），耗时 ${ms} ms`;
+  } catch (e) {
+    document.getElementById("writeResult").textContent = "写入失败：" + e.message;
+  }
+  refresh();
+}
+async function readOrders() {
+  const t0 = performance.now();
+  try {
+    await api("/api/orders");
+    const ms = (performance.now() - t0).toFixed(1);
+    document.getElementById("readResult").textContent =
+      `普通查询完成，耗时 ${ms} ms（等锁期间也应是毫秒级）`;
+  } catch (e) {
+    document.getElementById("readResult").textContent = "查询失败：" + e.message;
+  }
+}
+async function resetDemo() {
+  if (!confirm("将结束当前演示并重建两表与样例数据（已加的列会被移除），确认？")) return;
+  try { await post("/api/reset"); }
+  catch (e) { alert(e.message); }
+  refresh();
+}
+
+function renderState(s) {
+  const m = s.migration;
+  const st = document.getElementById("migState");
+  st.innerHTML = `<span class="badge b-${m.state}">${esc(m.state_label)}</span>`;
+  document.getElementById("migRequested").textContent = m.requested_at || "-";
+  document.getElementById("migAttempts").textContent = m.attempts;
+  document.getElementById("migFinished").textContent = m.finished_at || "-";
+  document.getElementById("migError").textContent = m.error || "";
+  document.getElementById("btnSubmit").disabled =
+      (m.state === "waiting" || m.state === "running" || m.state === "succeeded");
+  document.getElementById("btnCancel").disabled = !m.cancellable;
+  document.getElementById("cancelHint").textContent =
+      m.state === "waiting"
+        ? "申请正在等锁，此时撤销可保证之后即使释锁也不再执行。"
+        : "仅等待中的申请可以撤销。";
+  document.getElementById("injectFailure").disabled =
+      m.state === "waiting" || m.state === "running";
+
+  const txBody = document.getElementById("txBody");
+  if (!s.held_transactions.length) {
+    txBody.innerHTML = '<tr><td colspan="5" class="muted">暂无打开的演示事务</td></tr>';
+  } else {
+    txBody.innerHTML = s.held_transactions.map(t => `
+      <tr><td>${esc(t.token)}</td><td><span class="pill">${esc(t.table)}</span></td>
+      <td>${t.pid}</td><td>${esc(t.started_at)}</td>
+      <td><button class="danger" onclick="closeTx('${esc(t.token)}')">手动结束（释放锁）</button></td>
+      </tr>`).join("");
+  }
+
+  const colBody = document.getElementById("colBody");
+  colBody.innerHTML = Object.entries(s.columns).map(([table, exists]) => `
+    <tr><td>${esc(table)}</td>
+    <td><span class="badge ${exists ? "b-yes" : "b-no"}">
+      ${exists ? "已生效 ✓" : "未生效"}</span></td>
+    <td class="muted">${exists
+        ? "batch_no VARCHAR(64)，可空"
+        : "等待迁移在同一事务中添加 batch_no VARCHAR(64)"}</td></tr>`).join("");
+
+  const lockBody = document.getElementById("lockBody");
+  if (!s.server_lock_queue.length) {
+    lockBody.innerHTML = '<tr><td colspan="5" class="muted">无</td></tr>';
+  } else {
+    lockBody.innerHTML = s.server_lock_queue.map(l => `
+      <tr><td>${esc(l.table_name)}</td><td>${esc(l.mode)}</td>
+      <td>${l.granted ? "是" : '<b style="color:var(--red)">否（排队中）</b>'}</td>
+      <td>${esc(l.state)}</td><td class="muted">${esc(l.query)}</td></tr>`).join("");
+  }
+
+  document.getElementById("eventLog").textContent =
+      m.events.map(e => `${e.time}  ${e.message}`).join("\n") || "（暂无事件）";
+}
+
+function renderOrders(orders, done) {
+  const cols = done
+    ? ["订单号", "客户", "状态", "创建时间", "订单批次号", "明细"]
+    : ["订单号", "客户", "状态", "创建时间", "明细"];
+  document.getElementById("ordersHead").innerHTML =
+      "<tr>" + cols.map(c => `<th>${c}</th>`).join("") + "</tr>";
+  document.getElementById("ordersBody").innerHTML = orders.map(o => {
+    const detail = o.items.map(i => {
+      const b = (i.batch_no !== undefined && i.batch_no !== null)
+        ? ` <span class="pill">批次:${esc(i.batch_no)}</span>` : "";
+      return `${esc(i.sku)} × ${i.quantity} @ ${i.unit_price}${b}`;
+    }).join("<br>");
+    const base = `<td>${esc(o.order_no)}</td><td>${esc(o.customer)}</td>
+      <td>${esc(o.status)}</td><td class="muted">${esc(String(o.created_at))}</td>`;
+    const batch = done ? `<td>${esc(o.batch_no || "")}</td>` : "";
+    return `<tr>${base}${batch}<td>${detail}</td></tr>`;
+  }).join("");
+}
+
+async function refresh() {
+  try {
+    const s = await api("/api/state");
+    renderState(s);
+    const orders = await api("/api/orders");
+    const key = JSON.stringify(orders) + "|" + s.migration_done;
+    if (key !== lastOrdersKey) {
+      lastOrdersKey = key;
+      renderOrders(orders, s.migration_done);
+    }
+  } catch (e) {
+    document.getElementById("eventLog").textContent =
+      "状态刷新失败：" + e.message;
+  }
+}
+refresh();
+setInterval(refresh, 1000);
+</script>
+</body>
+</html>
