@@ -14,13 +14,19 @@ from __future__ import annotations
 import threading
 import time
 
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, jsonify, render_template, request, send_file
 
-from . import db
+from . import backup, db
+from .backup import BackupDrillManager
 from .migration import MigrationManager
 
 app = Flask(__name__)
 manager = MigrationManager()
+drill_manager = BackupDrillManager()
+
+# 控制类操作（提交迁移 / 重置 / 发起演练）的状态转移串行化，
+# 避免“检查时没在跑、随后同时启动”的竞态。
+_ops_lock = threading.RLock()
 
 # 保持打开的演示读事务：{token: {"conn": conn, "table": ..., "pid": ...,
 #                                "started_at": ..., "rows": ...}}
@@ -50,6 +56,7 @@ def api_state():
         ]
     return jsonify(
         migration=manager.snapshot(),
+        backup_drill=drill_manager.snapshot(),
         columns=columns,
         migration_done=all(columns.values()),
         held_transactions=held,
@@ -113,10 +120,16 @@ def api_demo_tx_close():
 @app.post("/api/migration/submit")
 def api_migration_submit():
     payload = request.json or {}
-    try:
-        manager.submit(inject_failure=bool(payload.get("inject_failure")))
-    except RuntimeError as exc:
-        return jsonify({"error": str(exc)}), 409
+    with _ops_lock:
+        if drill_manager.is_running:
+            return jsonify({
+                "error": "订单库备份演练进行中：ALTER 需要访问排他锁，"
+                         "会与备份锁互相影响，请等演练结束后再提交迁移",
+            }), 409
+        try:
+            manager.submit(inject_failure=bool(payload.get("inject_failure")))
+        except RuntimeError as exc:
+            return jsonify({"error": str(exc)}), 409
     return jsonify(manager.snapshot())
 
 
@@ -127,6 +140,57 @@ def api_migration_cancel():
     except RuntimeError as exc:
         return jsonify({"error": str(exc)}), 409
     return jsonify(manager.snapshot())
+
+
+# ---------------------------------------------------------------- 备份演练
+@app.get("/api/backup-drill/state")
+def api_backup_drill_state():
+    return jsonify(drill_manager.snapshot())
+
+
+@app.post("/api/backup-drill/start")
+def api_backup_drill_start():
+    """值班员发起订单库备份演练。
+
+    可选 body：
+    - pace: 0~5，每个阶段之间停顿秒数（演示“演练期间试写”时用）；
+    - inject: restore_failure / schema_mismatch / row_mismatch 故障注入。
+    """
+    payload = request.get_json(silent=True) or {}
+    with _ops_lock:
+        mig = manager.snapshot()["state"]
+        if mig in ("waiting", "running"):
+            return jsonify({
+                "error": "加列迁移正在等待锁/执行中，请先结束或撤销迁移，"
+                         "再发起备份演练（避免 DDL 与备份相互阻塞）",
+            }), 409
+        try:
+            drill_manager.start(
+                pace=float(payload.get("pace") or 0.0),
+                inject=str(payload.get("inject") or ""),
+            )
+        except RuntimeError as exc:
+            return jsonify({"error": str(exc)}), 409
+        except (TypeError, ValueError):
+            return jsonify({"error": "pace 必须是 0~5 的数字"}), 400
+    return jsonify(drill_manager.snapshot()), 202
+
+
+@app.get("/api/backup/download")
+def api_backup_download():
+    """下载最近一次“还原 + 核对”通过后才上线的备份。"""
+    path = drill_manager.published_path()
+    if not path.exists():
+        return jsonify({
+            "error": "还没有通过演练核对的备份，请先发起并通过一次备份演练",
+        }), 404
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    return send_file(
+        path,
+        mimetype="application/sql",
+        as_attachment=True,
+        download_name=f"orders_backup_verified_{stamp}.sql",
+    )
 
 
 # ---------------------------------------------------------------- 普通读写
@@ -178,14 +242,17 @@ def api_columns():
 # ---------------------------------------------------------------- 重置演示
 @app.post("/api/reset")
 def api_reset():
-    with _demo_lock:
-        if _demo_conns:
-            return jsonify({"error": "请先结束所有演示事务再重置"}), 409
-    try:
-        manager.reset()
-        db.reset_database()
-    except RuntimeError as exc:
-        return jsonify({"error": str(exc)}), 409
+    with _ops_lock:
+        if drill_manager.is_running:
+            return jsonify({"error": "备份演练进行中，不能重置演示"}), 409
+        with _demo_lock:
+            if _demo_conns:
+                return jsonify({"error": "请先结束所有演示事务再重置"}), 409
+        try:
+            manager.reset()
+            db.reset_database()
+        except RuntimeError as exc:
+            return jsonify({"error": str(exc)}), 409
     return jsonify({"ok": True})
 
 
@@ -195,3 +262,14 @@ def init_app() -> None:
     db.init_schema(seed=True)
     if db.migration_done():
         manager.state = "succeeded"
+    # 兜底清理上次进程异常退出遗留的演练临时库；有界等待，绝不阻塞启动
+    result: dict = {"stale": []}
+
+    def _stale_cleanup() -> None:
+        result["stale"] = backup.cleanup_stale_databases()
+
+    cleaner = threading.Thread(target=_stale_cleanup, daemon=True)
+    cleaner.start()
+    cleaner.join(timeout=6.0)
+    if result["stale"]:
+        print(f"[init_app] 已清理遗留演练临时库: {', '.join(result['stale'])}")

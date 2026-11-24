@@ -23,8 +23,12 @@ services:
       PGUSER: postgres
       PGPASSWORD: postgres
       PGDATABASE: orders_demo
+      BACKUP_DIR: /srv/app/backups
     ports:
       - "8000:8000"
+    volumes:
+      # 通过演练核对的 orders 备份会落到宿主机 ./backups，也可直接取文件
+      - ./backups:/srv/app/backups
     depends_on:
       db:
         condition: service_healthy

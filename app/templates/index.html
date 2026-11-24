@@ -59,6 +59,22 @@
           background: #eef2ff; color: #3730a3; }
   .hint { background: #fffbeb; border: 1px solid #fde68a; color: #92400e;
           border-radius: 8px; padding: 10px 12px; font-size: 12.5px; }
+  .hint.info { background: #eff6ff; border-color: #bfdbfe; color: #1e40af; }
+  .chips { display: flex; gap: 6px; flex-wrap: wrap; margin: 10px 0 4px; }
+  .chip { font-size: 12px; padding: 3px 10px; border-radius: 999px;
+          background: #f1f5f9; color: var(--muted); border: 1px solid var(--line); }
+  .chip.active { background: #dbeafe; color: var(--blue); border-color: #93c5fd;
+                 font-weight: 600; }
+  .chip.done { background: #dcfce7; color: var(--green); border-color: #86efac; }
+  .chip.failed { background: #fee2e2; color: var(--red); border-color: #fca5a5;
+                 font-weight: 600; }
+  a.btnlink { display: inline-block; text-decoration: none; border-radius: 7px;
+              padding: 7px 14px; font-size: 13px; background: var(--green);
+              color: #fff; font-weight: 600; }
+  a.btnlink.disabled { background: #cbd5e1; pointer-events: none; }
+  .warnline { color: var(--amber); font-size: 12.5px; }
+  pre.cmd { background: #0f172a; color: #bae6fd; border-radius: 8px; padding: 10px 12px;
+            font-size: 12px; overflow: auto; margin: 8px 0 0; white-space: pre; }
   ul.steps { margin: 8px 0 0; padding-left: 18px; color: var(--muted);
              font-size: 12.5px; }
 </style>
@@ -160,6 +176,61 @@
     </table>
   </section>
 
+  <section class="card full" id="drillCard">
+    <h2>⑦ 订单库备份演练（orders + order_items：快照备份 → 还原临时库 → 同快照核对 → 才换下载）
+      <span id="drillBadge"></span>
+    </h2>
+
+    <div class="chips" id="drillChips"></div>
+
+    <div class="kv" style="margin-top:10px">
+      <b>当前阶段</b><span id="drillStage">-</span>
+      <b>已提交快照</b><span id="drillSnapshot" class="muted">-</span>
+      <b>演练临时库</b><span id="drillTempDb" class="muted">-</span>
+      <b>开始 / 完成</b><span id="drillTime" class="muted">-</span>
+      <b>清理临时库</b><span id="drillCleanup">-</span>
+      <b>失败原因</b><span id="drillError" class="err" style="white-space:pre-wrap"></span>
+    </div>
+
+    <div class="row" style="margin-top:12px">
+      <button id="btnDrillStart" onclick="startDrill()">开始备份演练</button>
+      <label><input type="checkbox" id="drillSlow"> 放慢节奏（每阶段约 1 秒，便于演练期间试写订单）</label>
+      <select id="drillInject">
+        <option value="">不注入故障（正常演练）</option>
+        <option value="restore_failure">故障注入：还原失败（备份末尾加错误 SQL）</option>
+        <option value="schema_mismatch">故障注入：还原后篡改列长度</option>
+        <option value="row_mismatch">故障注入：还原后篡改一行数据</option>
+      </select>
+      <a class="btnlink disabled" id="drillDownload" href="/api/backup/download">下载已通过核对的备份 (.sql)</a>
+    </div>
+
+    <div id="drillPublished" class="ok" style="margin-top:10px"></div>
+    <div id="drillResult" class="muted"></div>
+
+    <p class="hint info" style="margin-top:12px">
+      <b>演练期间另行试写一单的操作步骤：</b>
+      ① 勾选上方“放慢节奏”，点击“开始备份演练”；
+      ② 立刻到 ④ 连续点击“写入订单+明细并计时”，写单应毫秒级成功并提交
+      （备份只持有与写入兼容的 <code>AccessShareLock</code>，核对读的是演练开始时的已提交快照，
+      快照之后提交的新单不在本次备份内，再演练一次即可纳入）；
+      也可以<b>另开一个终端</b>执行下面的命令连续试写：
+    </p>
+    <pre class="cmd">for i in 1 2 3; do \
+  curl -s -o /dev/null -w "write $i -> HTTP %{http_code}, %{time_total}s\n" \
+    -X POST http://localhost:8000/api/orders \
+    -H 'Content-Type: application/json' \
+    -d '{"customer":"演练期间写单","items":[{"sku":"SKU-DRILL","quantity":1,"unit_price":"8.88"}]}'; \
+  sleep 1; \
+done</pre>
+    <p class="hint" style="margin-top:10px">
+      只有“实际还原到临时库 + 列定义核对 + 每行数据核对”全部通过，新备份才会原子替换为下载文件；
+      任一步失败都会在此显示原因，并保留上一次通过核对的备份。演练结束后临时库会被 DROP 清理
+      （若清理异常也会在“清理临时库”一栏明示）。加列迁移前后本演练均可进行：核对按当时真实列定义逐列比较。
+    </p>
+
+    <pre id="drillLog" class="log" style="max-height:170px;margin-top:10px"></pre>
+  </section>
+
   <section class="card full">
     <h2>事件日志</h2>
     <pre id="eventLog" class="log"></pre>
@@ -254,6 +325,87 @@ async function resetDemo() {
   catch (e) { alert(e.message); }
   refresh();
 }
+async function startDrill() {
+  try {
+    await post("/api/backup-drill/start", {
+      pace: document.getElementById("drillSlow").checked ? 1.0 : 0.0,
+      inject: document.getElementById("drillInject").value || "",
+    });
+  } catch (e) { alert(e.message); }
+  refresh();
+}
+
+function renderDrill(d) {
+  if (!d) return;
+  const badge = document.getElementById("drillBadge");
+  const cls = d.state === "succeeded" ? "b-succeeded"
+      : d.state === "failed" ? "b-failed"
+      : d.state === "running" ? "b-running" : "b-idle";
+  badge.innerHTML = ` <span class="badge ${cls}">${esc(d.state_label)}</span>`;
+
+  document.getElementById("drillStage").textContent =
+      d.state === "idle" ? "尚未演练" : (d.stage_label || "-");
+  document.getElementById("drillSnapshot").textContent = d.snapshot_id || "-";
+  document.getElementById("drillTempDb").textContent = d.temp_db || "-";
+  document.getElementById("drillTime").textContent =
+      `${d.started_at || "-"}  →  ${d.finished_at || "进行中…"}`;
+
+  const cu = document.getElementById("drillCleanup");
+  if (!d.temp_db) { cu.textContent = "-"; cu.className = ""; }
+  else if (d.cleanup_ok === true) {
+    cu.textContent = "已 DROP 清理 ✓"; cu.className = "ok";
+  } else if (d.cleanup_pending || d.cleanup_ok === null) {
+    cu.textContent = "清理中…"; cu.className = "muted";
+  } else if (d.cleanup_ok === false) {
+    cu.textContent = "清理失败：" + (d.cleanup_error || "未知原因");
+    cu.className = "warnline";
+  }
+
+  const errEl = document.getElementById("drillError");
+  errEl.textContent = d.error || "";
+
+  // 步骤条
+  const activeIdx = d.stages.findIndex(x => x.key === d.stage);
+  const failed = d.state === "failed";
+  document.getElementById("drillChips").innerHTML = d.stages.map((x, i) => {
+    let c = "chip";
+    if (d.state === "succeeded" || (d.stage === "done")) c += " done";
+    else if (failed && i === activeIdx) c += " failed";
+    else if (d.state === "running" && i === activeIdx) c += " active";
+    else if (d.state === "running" && activeIdx >= 0 && i < activeIdx) c += " done";
+    else if ((d.state === "failed") && activeIdx >= 0 && i < activeIdx) c += " done";
+    const mark = c.includes("done") ? "✓ " : (c.includes("active") ? "… " : "");
+    return `<span class="${c}">${mark}${esc(x.label)}</span>`;
+  }).join("");
+
+  // 下载按钮与已发布信息
+  const dl = document.getElementById("drillDownload");
+  const pub = d.published;
+  const pubEl = document.getElementById("drillPublished");
+  if (pub && pub.filename) {
+    dl.classList.remove("disabled");
+    const kb = (pub.size_bytes / 1024).toFixed(1);
+    const tbl = pub.tables ? Object.entries(pub.tables)
+        .map(([t, v]) => `${t} ${v.columns}列/${v.rows}行`).join("，") : "";
+    pubEl.textContent =
+      `当前下载文件＝上次通过核对的备份：${pub.filename}（${kb} KiB，` +
+      `发布于 ${pub.published_at || "-"}，快照 ${pub.snapshot_id || "-"}，${tbl}）`;
+  } else {
+    dl.classList.add("disabled");
+    pubEl.textContent = "尚无通过演练的备份；首次演练通过后这里会出现可下载文件。";
+  }
+
+  const r = d.result;
+  document.getElementById("drillResult").textContent = r
+    ? `本次核对 ${r.rows_checked} 行，备份 ${r.bytes} 字节，总耗时 ${r.duration_ms} ms。` : "";
+
+  document.getElementById("drillLog").textContent =
+      (d.events || []).map(e => `${e.time}  ${e.message}`).join("\n") || "（暂无事件）";
+
+  document.getElementById("btnDrillStart").disabled = (d.state === "running");
+  document.getElementById("drillSlow").disabled = (d.state === "running");
+  document.getElementById("drillInject").disabled = (d.state === "running");
+}
 
 function renderState(s) {
   const m = s.migration;
@@ -305,6 +457,8 @@ function renderState(s) {
 
   document.getElementById("eventLog").textContent =
       m.events.map(e => `${e.time}  ${e.message}`).join("\n") || "（暂无事件）";
+
+  renderDrill(s.backup_drill);
 }
 
 function renderOrders(orders, done) {

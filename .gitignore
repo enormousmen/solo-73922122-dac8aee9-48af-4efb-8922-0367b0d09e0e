@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.venv/
+backups/*.sql
+backups/*.json
+backups/staging/
+.pytest_cache/
